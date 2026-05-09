@@ -1,27 +1,18 @@
 """
 Convertidor de Documentos - EasyDoc Suite V 1.1
-Estilo Retro/Cyberpunk basado en Figma (Soporte Multiformato)
+Estilo Retro/Cyberpunk basado en Figma (Multiproceso para fluidez máxima)
 """
 
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
-import threading
 import os
 import sys
 from pathlib import Path
 from PIL import Image, ImageTk, ImageSequence
-import time
-
-
-# --- NUEVA LIBRERÍA PARA PDF A WORD ---
-try:
-    from pdf2docx import Converter as PDFConverter
-except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pdf2docx"])
-    from pdf2docx import Converter as PDFConverter
+import multiprocessing
+import queue
 
 def obtener_ruta_recurso(ruta_relativa):
     try:
@@ -30,20 +21,19 @@ def obtener_ruta_recurso(ruta_relativa):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, ruta_relativa)
 
-try:
-    import win32com.client
-    import pythoncom
-except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pywin32"])
-    import win32com.client
-    import pythoncom
-
-# --- LÓGICA DE CONVERSIÓN MULTIFORMATO ---
-def convertir_lote(archivos, carpeta_destino, modo, callback_estado, callback_error):
+# --- PROCESO TRABAJADOR INDEPENDIENTE (Bypass del GIL) ---
+# Esta función corre en un "universo" (proceso) completamente separado de la interfaz gráfica
+def trabajador_conversion(archivos, carpeta_destino, modo, cola_mensajes):
     app_com = None
     try:
-        # Inicializar el motor COM si es necesario
+        # Importamos aquí dentro para asegurar que el nuevo proceso tenga sus propias librerías
+        import win32com.client
+        import pythoncom
+        from pdf2docx import Converter as PDFConverter
+        
+        # Inicializamos el motor de Windows para este proceso
+        pythoncom.CoInitialize()
+
         if modo == "Word -> PDF":
             app_com = win32com.client.Dispatch("Word.Application")
             app_com.Visible = False
@@ -55,19 +45,15 @@ def convertir_lote(archivos, carpeta_destino, modo, callback_estado, callback_er
         elif modo == "PowerPoint -> PDF":
             app_com = win32com.client.Dispatch("PowerPoint.Application")
 
-        for i, archivo in enumerate(archivos):
+        for archivo in archivos:
             nombre = Path(archivo).name
-            callback_estado(f"Procesando: {nombre}")
+            # Enviamos un mensaje a la interfaz gráfica sin interrumpirla
+            cola_mensajes.put({"tipo": "estado", "texto": f"Procesando: {nombre}"})
             
-            time.sleep(0.1)
-
             try:
                 archivo_abs = str(Path(archivo).resolve())
-                
-                # Determinar extensión de salida
                 ext_dest = ".docx" if modo == "PDF -> Word" else ".pdf"
-
-                # Determinar ruta de salida
+                
                 if carpeta_destino:
                     dest_path = os.path.join(carpeta_destino, Path(archivo).stem + ext_dest)
                 else:
@@ -75,40 +61,43 @@ def convertir_lote(archivos, carpeta_destino, modo, callback_estado, callback_er
                 
                 dest_abs = str(Path(dest_path).resolve())
 
-                # Ejecutar la conversión según el modo
                 if modo == "Word -> PDF":
                     doc = app_com.Documents.Open(archivo_abs)
-                    doc.SaveAs(dest_abs, FileFormat=17) # 17 = wdFormatPDF
+                    doc.SaveAs(dest_abs, FileFormat=17) 
                     doc.Close(False)
-                
                 elif modo == "Excel -> PDF":
                     wb = app_com.Workbooks.Open(archivo_abs)
-                    wb.ExportAsFixedFormat(0, dest_abs) # 0 = xlTypePDF
+                    wb.ExportAsFixedFormat(0, dest_abs) 
                     wb.Close(False)
-                
                 elif modo == "PowerPoint -> PDF":
                     prs = app_com.Presentations.Open(archivo_abs, WithWindow=False)
-                    prs.SaveAs(dest_abs, 32) # 32 = ppSaveAsPDF
+                    prs.SaveAs(dest_abs, 32) 
                     prs.Close()
-                
                 elif modo == "PDF -> Word":
-                    # Usando pdf2docx
                     cv = PDFConverter(archivo_abs)
                     cv.convert(dest_abs, start=0, end=None)
                     cv.close()
 
             except Exception as e:
-                callback_error(nombre, str(e))
+                cola_mensajes.put({"tipo": "error", "nombre": nombre, "error": str(e)})
 
-                time.sleep(0.1)
-                
+    except Exception as err_general:
+        cola_mensajes.put({"tipo": "error", "nombre": "Error Crítico", "error": str(err_general)})
+        
     finally:
-        # Limpieza de procesos en segundo plano
         if app_com:
             try:
                 app_com.Quit()
             except:
                 pass
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
+        
+        # Avisamos a la interfaz que ya terminamos
+        cola_mensajes.put({"tipo": "fin", "total": len(archivos)})
+
 
 class TkinterDnD_CTk(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self, *args, **kwargs):
@@ -162,7 +151,7 @@ class ConversorApp:
         if not self.animating or not self.gif_frames: return
         self.gif_label.config(image=self.gif_frames[self.frame_index])
         self.frame_index = (self.frame_index + 1) % len(self.gif_frames)
-        self.root.after(50, self.animar_gif)
+        self.root.after(40, self.animar_gif) # Ajustado a 40ms para mayor fluidez (25 FPS)
 
     def iniciar_animacion(self):
         if self.gif_frames:
@@ -213,7 +202,6 @@ class ConversorApp:
         motor_frame.pack(pady=(15, 5))
         ctk.CTkLabel(motor_frame, text="Tipo de conversión:", text_color=TEXT_COLOR, font=FONT_RETRO).pack()
         
-        # --- OPCIONES DE CONVERSIÓN ---
         self.opciones_motor = ["Word -> PDF", "PDF -> Word", "Excel -> PDF", "PowerPoint -> PDF"]
         self.tipo_conversion_var = ctk.StringVar(value=self.opciones_motor[0])
         ctk.CTkOptionMenu(
@@ -226,7 +214,7 @@ class ConversorApp:
             dropdown_fg_color=PANEL_COLOR, 
             corner_radius=0, 
             font=FONT_RETRO,
-            command=self.cambio_motor # Limpia la lista si cambias de modo
+            command=self.cambio_motor
         ).pack(pady=5)
 
         self.estado_lbl = ctk.CTkLabel(self.root, text="Listo para procesar", text_color="#A991D4", font=("Consolas", 10))
@@ -235,21 +223,15 @@ class ConversorApp:
         self.btn_conv = ctk.CTkButton(self.root, text="⚡ INICIAR CONVERSION ⚡", font=("Consolas", 14, "bold"), height=45, width=300, fg_color=NEON_GREEN, hover_color="#7BCC00", text_color="black", corner_radius=2, border_color="white", border_width=1, command=self.iniciar_conversion)
         self.btn_conv.pack(pady=(0, 20))
 
-    # --- LÓGICA DE FILTROS SEGÚN EL MOTOR ---
     def obtener_filtros_archivos(self):
         modo = self.tipo_conversion_var.get()
-        if modo == "Word -> PDF":
-            return [("Archivos de Word", "*.docx *.doc")], ('.docx', '.doc')
-        elif modo == "Excel -> PDF":
-            return [("Archivos de Excel", "*.xlsx *.xls")], ('.xlsx', '.xls')
-        elif modo == "PowerPoint -> PDF":
-            return [("Archivos de PowerPoint", "*.pptx *.ppt")], ('.pptx', '.ppt')
-        elif modo == "PDF -> Word":
-            return [("Archivos PDF", "*.pdf")], ('.pdf',)
+        if modo == "Word -> PDF": return [("Archivos de Word", "*.docx *.doc")], ('.docx', '.doc')
+        elif modo == "Excel -> PDF": return [("Archivos de Excel", "*.xlsx *.xls")], ('.xlsx', '.xls')
+        elif modo == "PowerPoint -> PDF": return [("Archivos de PowerPoint", "*.pptx *.ppt")], ('.pptx', '.ppt')
+        elif modo == "PDF -> Word": return [("Archivos PDF", "*.pdf")], ('.pdf',)
         return [("Todos los archivos", "*.*")], ()
 
     def cambio_motor(self, seleccion):
-        """Si el usuario cambia el tipo de conversión, se vacía la lista por seguridad"""
         if self.archivos:
             self.limpiar()
             self.estado_lbl.configure(text=f"Modo cambiado a {seleccion}. Lista limpiada.")
@@ -262,19 +244,16 @@ class ConversorApp:
         self.chequear_placeholder()
         archivos = self.root.tk.splitlist(event.data)
         _, extensiones_validas = self.obtener_filtros_archivos()
-        
         for f in archivos:
-            if f.lower().endswith(extensiones_validas):
-                if f not in self.archivos:
-                    self.archivos.append(f)
-                    self.lista.insert("end", f"> {Path(f).name}")
+            if f.lower().endswith(extensiones_validas) and f not in self.archivos:
+                self.archivos.append(f)
+                self.lista.insert("end", f"> {Path(f).name}")
 
     def agregar(self):
         self.chequear_placeholder()
         filtros_dialogo, extensiones_validas = self.obtener_filtros_archivos()
         files = filedialog.askopenfilenames(filetypes=filtros_dialogo)
         for f in files:
-            # Re-verificar por si acaso en algunos SO el filtro falla
             if f.lower().endswith(extensiones_validas) and f not in self.archivos:
                 self.archivos.append(f)
                 self.lista.insert("end", f"> {Path(f).name}")
@@ -299,44 +278,63 @@ class ConversorApp:
             self.carpeta_destino = folder
             self.destino_var.set(folder)
 
+    # --- INICIO DEL MULTIPROCESO ---
     def iniciar_conversion(self):
         if not self.archivos: return
         self.btn_conv.configure(state="disabled")
         self.iniciar_animacion()
         
         modo_actual = self.tipo_conversion_var.get()
-        threading.Thread(target=self._hilo, args=(modo_actual,), daemon=True).start()
+        self.errores = []
+        
+        # 1. Creamos la cola de comunicación
+        self.cola_mensajes = multiprocessing.Queue()
+        
+        # 2. Iniciamos el trabajador en un PROCESO NUEVO (no un hilo)
+        self.proceso_worker = multiprocessing.Process(
+            target=trabajador_conversion,
+            args=(self.archivos, self.carpeta_destino, modo_actual, self.cola_mensajes)
+        )
+        self.proceso_worker.start()
+        
+        # 3. Ponemos a la interfaz a escuchar la cola
+        self.root.after(100, self.monitorear_cola)
 
-    def _hilo(self, modo):
-        # 1. Inicializar el motor COM para este hilo secundario (Vital para que no se congele)
-        pythoncom.CoInitialize()
-        
-        total = len(self.archivos)
-        
-        # 2. Truco de magia: Enviar la actualización de texto AL HILO PRINCIPAL de forma segura
-        def actualizar_estado(texto):
-            self.root.after(0, lambda: self.estado_lbl.configure(text=texto))
-        
-        # Enviar los errores también de forma segura
-        def registrar_error(n, m):
-            self.errores.append(f"{n}: {m}")
-        
-        # 3. Ejecutar la conversión
-        convertir_lote(self.archivos, self.carpeta_destino, modo, actualizar_estado, registrar_error)
-        
-        # 4. Finalizar la UI de forma segura en el hilo principal
-        def finalizar_ui():
-            self.detener_animacion()
-            self.btn_conv.configure(state="normal")
-            self.estado_lbl.configure(text="> CONVERSION COMPLETADA <")
-            messagebox.showinfo("Éxito", f"Se procesaron {total} archivos correctamente.")
+    # --- ESCUCHA CONSTANTE ---
+    def monitorear_cola(self):
+        try:
+            # Procesamos todos los mensajes que hayan llegado desde el trabajador
+            while True: 
+                mensaje = self.cola_mensajes.get_nowait()
+                
+                if mensaje["tipo"] == "estado":
+                    self.estado_lbl.configure(text=mensaje["texto"])
+                
+                elif mensaje["tipo"] == "error":
+                    self.errores.append(f"{mensaje['nombre']}: {mensaje['error']}")
+                
+                elif mensaje["tipo"] == "fin":
+                    self.detener_animacion()
+                    self.btn_conv.configure(state="normal")
+                    self.estado_lbl.configure(text="> CONVERSION COMPLETADA <")
+                    
+                    if self.errores:
+                        messagebox.showwarning("Completado con errores", f"Se procesaron {mensaje['total']} archivos, pero hubo problemas:\n" + "\n".join(self.errores[:5]))
+                    else:
+                        messagebox.showinfo("Éxito", f"Se procesaron {mensaje['total']} archivos correctamente.")
+                    return # Salimos del ciclo de monitoreo
+                
+        except queue.Empty:
+            pass
+            
+        # Si no ha llegado el mensaje de "fin", volvemos a chequear en 50ms
+        self.root.after(50, self.monitorear_cola)
 
-        self.root.after(0, finalizar_ui)
-        
-        # 5. Cerrar el motor COM de este hilo
-        pythoncom.CoUninitialize()
 
 if __name__ == "__main__":
+    # ¡ESTA LÍNEA ES MAGIA PURA! Es obligatoria para que el .exe compilado soporte Multiprocesamiento.
+    multiprocessing.freeze_support() 
+    
     root = TkinterDnD_CTk()
     app = ConversorApp(root)
     root.mainloop()
